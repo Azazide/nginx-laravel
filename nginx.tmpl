@@ -1,0 +1,193 @@
+{{ $CurrentContainer := where $ "ID" .Docker.CurrentContainerID | first }}
+{{ $debug_all := $.Env.DEBUG }}
+
+include /etc/nginx/proxy.conf;
+
+# If we receive X-Forwarded-Proto, pass it through; otherwise, pass along the
+# scheme used to connect to this server
+map $http_x_forwarded_proto $proxy_x_forwarded_proto {
+  default $http_x_forwarded_proto;
+  ''      $scheme;
+}
+
+# If we receive X-Forwarded-For, pass it through;
+# otherwise, pass along the remote address
+map $http_x_forwarded_for $proxy_x_forwarded_for {
+  default $http_x_forwarded_for;
+  ''      $remote_addr;
+}
+
+# If we receive X-Forwarded-Port, pass it through; otherwise, pass along the
+# server port the client connected to
+map $http_x_forwarded_port $proxy_x_forwarded_port {
+  default $http_x_forwarded_port;
+  ''      $server_port;
+}
+
+# If we receive Upgrade, set Connection to "upgrade"; otherwise, delete any
+# Connection header that may have been passed to this server
+map $http_upgrade $proxy_connection {
+  default upgrade;
+  ''      close;
+}
+
+# Set appropriate X-Forwarded-Ssl header based on $proxy_x_forwarded_proto
+map $proxy_x_forwarded_proto $proxy_x_forwarded_ssl {
+  default off;
+  https   on;
+}
+
+access_log off;
+
+# Apply fix for very long server names
+server_names_hash_bucket_size 128;
+
+{{ if (exists "/etc/letsencrypt/ssl-dhparams.pem") }}
+ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+{{ end }}
+
+# HTTP 1.1 support
+proxy_http_version 1.1;
+proxy_buffering off;
+proxy_set_header Host $host;
+proxy_set_header Upgrade $http_upgrade;
+proxy_set_header Connection $proxy_connection;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $proxy_x_forwarded_proto;
+proxy_set_header X-Forwarded-Ssl $proxy_x_forwarded_ssl;
+proxy_set_header X-Forwarded-Port $proxy_x_forwarded_port;
+proxy_set_header X-Original-URI $request_uri;
+proxy_set_header SERVER-PORT $server_port;
+proxy_set_header SERVER-ADDR $server_addr;
+proxy_set_header REMOTE-PORT $remote_port;
+proxy_set_header REMOTE-ADDR $remote_addr;
+proxy_set_header NGINX-SCHEME $scheme;
+proxy_set_header Proxy "";
+
+# Unrecognized host
+server {
+    return 403;
+}
+
+{{ $enable_ipv6 := eq (or ($.Env.ENABLE_IPV6) "") "true" }}
+
+{{ define "location" }}
+    {{ $container := .Container }}
+    {{ $protocol := .Protocol }}
+    {{ $port := .Port }}
+    {{ $networks := .Networks }}
+    {{ $debug := (eq (coalesce $container.Env.DEBUG .Debug "false") "true") }}
+    {{ $address := where $container.Addresses "Port" $port | first }}
+    {{ $upstream_link := "empty" }}
+
+    {{ if $debug }}
+        {{ if not $address }}
+        # [debug] WARN: Port is not exposed
+        {{ end }}
+    {{ end }}
+
+    {{ range $knownNetwork := $networks }}
+        {{ range $containerNetwork := $container.Networks }}
+            {{ if (and (ne $containerNetwork.Name "ingress") (or (eq $knownNetwork.Name $containerNetwork.Name) (eq $knownNetwork.Name "host"))) }}
+                {{/* Port was found in the container. */}}
+                {{ if $address }}
+                    {{/* If we got the container from swarm and the port is published to host */}}
+                    {{ if and $container.Node.ID $address.HostPort }}
+                        {{ $upstream_link = (print $container.Node.Address.IP ":" $address.HostPort) }}
+                    {{ else if $containerNetwork }}
+                        {{ $upstream_link = (print $containerNetwork.IP ":" $address.Port) }}
+                    {{ end }}
+                {{/* Just send traffic to the container */}}
+                {{ else if $containerNetwork }}
+                    {{ if $containerNetwork.IP }}
+                        {{ $upstream_link = (print $containerNetwork.IP ":" $port) }}
+                    {{ end }}
+                {{ end }}
+            {{ end }}
+        {{ end }}
+    {{ end }}
+
+
+    {{ if (ne $upstream_link "empty") }}
+        location / {
+            proxy_pass {{ trim $protocol }}://{{ trim $upstream_link }};
+        }
+    {{ else }}
+        return 503;
+    {{ end }}
+{{ end }}
+
+{{ range $host, $containers := groupByMulti $ "Env.VIRTUAL_HOST" "," }}
+    {{ $container := (first $containers) }}
+    {{ $host := trim $host }}
+    {{ $internal_network := eq (or ($container.Env.NETWORK_ACCESS) "external") "internal" }}
+	{{ $debug := (eq (coalesce $container.Env.DEBUG $debug_all "false") "true") }}
+
+# [host] {{ $host }} ({{ $container.Name }})
+
+    {{ if $debug }}
+# [debug] Exposed Ports: {{ $container.Addresses }}
+    {{ end }}
+
+	{{ range $http_port := (split (or ($container.Env.VIRTUAL_HTTP_PORT) "") ",") }}
+	    {{ $http_port := trim $http_port }}
+    # [http] {{ $http_port }}
+    server {
+        server_name {{ $host }};
+        server_tokens off;
+
+        listen {{ $http_port }};
+        {{ if $enable_ipv6 }}
+        listen [::]:{{ $http_port }};
+        {{ end }}
+
+        {{ if $internal_network }}
+        # Only allow traffic from internal clients
+        include /etc/nginx/network_internal.conf;
+        {{ end }}
+
+        {{ template "location" (dict "Container" $container "Protocol" "http" "Port" $http_port "Networks" $CurrentContainer.Networks "Debug" $debug_all) }}
+    }
+	{{ end }}
+
+
+
+    {{ $cert_name := trimPrefix "www." $host }}
+    {{ $is_https := (and (exists (printf "/etc/letsencrypt/live/%s/fullchain.pem" $cert_name)) (exists (printf "/etc/letsencrypt/live/%s/privkey.pem" $cert_name))) }}
+
+    {{ if $is_https }}
+    {{ range $https_port := (split (or ($container.Env.VIRTUAL_HTTPS_PORT) "") ",") }}
+        {{ $https_port := trim $https_port }}
+
+    # [https] {{ $https_port }}
+    server {
+        server_name {{ $host }};
+        server_tokens off;
+
+        listen {{ $https_port }} ssl http2;
+        {{ if $enable_ipv6 }}
+        listen [::]:{{ $https_port }} ssl http2;
+        {{ end }}
+
+        {{ if $internal_network }}
+        # Only allow traffic from internal clients
+        include /etc/nginx/network_internal.conf;
+        {{ end }}
+
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384";
+        ssl_prefer_server_ciphers off;
+
+        ssl_session_cache shared:SSL:50m;
+        ssl_session_tickets off;
+        ssl_session_timeout 1440m;
+
+        ssl_certificate {{ (printf "/etc/letsencrypt/live/%s/fullchain.pem" $cert_name) }};
+        ssl_certificate_key {{ (printf "/etc/letsencrypt/live/%s/privkey.pem" $cert_name) }};
+
+        {{ template "location" (dict "Container" $container "Protocol" "https" "Port" $https_port "Networks" $CurrentContainer.Networks "Debug" $debug_all) }}
+    }
+    {{ end }}
+    {{ end }}
+{{ end }}
